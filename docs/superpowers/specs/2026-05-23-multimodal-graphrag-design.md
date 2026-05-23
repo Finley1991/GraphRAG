@@ -6,18 +6,19 @@
 - **规模**：百万级 PDF/文本，持续增量摄入
 - **用户**：小团队内部使用
 - **查询能力**：全文 QA + 跨文档关联 + 实体/事件图谱 + 结构化提取 + 时序对比
-- **技术路线**：方案 B — 可控 Graph（Docling + Neo4j + Milvus 混合检索）
+- **技术路线**：方案 B — 可控 Graph（Docling + Neo4j + Milvus + ES 混合检索）
 
 ## 一、顶层架构
 
 ```
-查询层 → 查询路由 → 混合检索 → 结果合成 → LLM 回答
+查询层 → 查询路由 → 混合检索(ES+Milvus+Neo4j) → 结果合成 → LLM 回答
 图谱层 → LangExtract + LLM 抽取 → Neo4j 知识图谱 → Cypher 查询
-向量层 → HTML 分块 → BGE-M3 Embedding → Milvus 语义检索
+向量层 → HTML 分块 → BGE-M3 Embedding → Milvus 稠密向量检索
+全文层 → HTML 分块 → IK 分词 + BM25 → Elasticsearch 关键词检索
 解析层 → Docling/Marker/GLM-OCR/Qwen-VL → HTML + 元数据 JSON
 ```
 
-**核心数据流**：原始文档 → HTML 解析 → 分块+Embedding(→Milvus) + 实体关系抽取(→Neo4j) → 混合检索 → LLM 生成
+**核心数据流**：原始文档 → HTML 解析 → 分块+Embedding(→Milvus) + ES 索引(→Elasticsearch) + 实体关系抽取(→Neo4j) → 混合检索 → LLM 生成
 
 ## 二、多模态文档解析层
 
@@ -61,7 +62,7 @@
 
 Docling 解析置信度 < 0.7 的文档自动路由到 MinerU 处理（预计 < 5%），保留高精度但避免全量使用的资源成本。
 
-## 三、文本分块 + 向量存储
+## 三、文本分块 + 向量存储 + 全文索引
 
 ### 多粒度分块策略
 
@@ -96,6 +97,19 @@ Docling 解析置信度 < 0.7 的文档自动路由到 MinerU 处理（预计 < 
 ### 向量数据库
 
 **Milvus**：支持十亿级向量，标量过滤（按公司/行业/日期/文档类型），实现元数据预过滤 + 向量检索。
+
+### 全文检索引擎
+
+**Elasticsearch**：BM25 稀疏向量检索，与 Milvus 稠密向量互补：
+
+| 维度 | Elasticsearch (BM25) | Milvus (BGE-M3) |
+|------|---------------------|-----------------|
+| 匹配方式 | 关键词精确匹配 + TF-IDF | 语义相似度 |
+| 优势 | 股票代码、公司全称、法规编号等精确查找 | 同义词、改写、模糊语义理解 |
+| 分词 | IK 中文分词器 + 金融词典扩展 | Embedding 模型自处理 |
+| 典型场景 | "600519.SH 2024年年报" | "茅台去年业绩怎么样" |
+
+ES 索引与 Milvus Vector 共用同一套 Chunk（相同的 chunk_id），content_text 同时写入 ES 和 Milvus，检索后按 chunk_id 统一排序。
 
 ## 四、知识图谱 Schema
 
@@ -199,12 +213,26 @@ L3 财务指标
 
 用户问题 → 意图分类 → 4 条路径：全文 QA / 图谱查询 / 指标查询 / 混合查询
 
+### 全文 QA 的双路检索
+
+```
+问题 "600519 2024年年报披露的营收"
+       │
+       ├─→ ES (BM25): "600519" "2024" "年报" "营收" → 精确 hit top 20
+       │
+       └─→ Milvus (稠密): "600519 2024年年报披露的营收" → 语义相似 top 20
+              │
+              └─→ RRF (Reciprocal Rank Fusion) 融合排序 → top 10
+                     │
+                     └─→ LLM 生成回答
+```
+
 ### 5 类查询的执行路径
 
 | 查询类型 | 示例 | 路径 |
 |---------|------|------|
-| 全文 QA | "茅台 Q3 营收多少？" | 向量检索 → LLM → API 校验指标值 |
-| 跨文档关联 | "宁德时代的供应链？" | Neo4j 图遍历 → 向量验证出处 |
+| 全文 QA | "茅台 Q3 营收多少？" | ES(精确)+Milvus(语义) 双路检索 → RRF 融合 → LLM → API 校验指标值 |
+| 跨文档关联 | "宁德时代的供应链？" | Neo4j 图遍历 → ES+向量验证出处 |
 | 实体事件图谱 | "新能源行业近 3 年并购事件" | Neo4j(Industry→Company→Event) |
 | 结构化提取 | "所有银行股的 ROE" | API 直接查询 |
 | 时序对比 | "新能源 vs 传统能源研发投入" | API(多期) + 向量(定性) |
@@ -212,9 +240,10 @@ L3 财务指标
 ### 混合检索流程
 
 1. 问题改写 + 实体链接
-2. 并行检索：Milvus(语义) + Neo4j(关系) + API(指标)
-3. 上下文融合（API 数据优先）
-4. LLM 生成回答
+2. 并行检索：ES(关键词) + Milvus(语义) + Neo4j(关系) + API(指标)
+3. RRF 融合 ES + Milvus 结果，Neo4j 结果补充实体上下文
+4. 上下文融合（API 数据优先）
+5. LLM 生成回答
 
 ### 数据优先级
 
@@ -230,6 +259,7 @@ L3 财务指标
 | OCR | GLM-OCR | 扫描件，替代 PaddleOCR |
 | 图数据库 | Neo4j | 成熟稳定，Cypher 查询 |
 | 向量数据库 | Milvus | 亿级向量支持，标量过滤 |
+| 全文检索引擎 | Elasticsearch | BM25 + IK 中文分词，关键词精确匹配 |
 | Embedding | BGE-M3 | 中文，8192 token，本地部署 |
 | LLM Proxy | vLLM | 部署 GLM-4 / DeepSeek / Qwen 等 |
 | 对象存储 | MinIO | 原始 PDF + HTML |
@@ -245,25 +275,26 @@ L3 财务指标
 | 组件 | 推荐配置 | 用途 |
 |------|---------|------|
 | CPU | 64 核 | 文档解析、分块 |
-| 内存 | **128 GB** | 解析中间态、Neo4j 缓存 |
+| 内存 | **128 GB** | 解析中间态、Neo4j 缓存、ES 堆内存(建议 16-32GB) |
 | GPU | 2× A100/4090 | Embedding + Qwen-VL + GLM-OCR + vLLM |
-| 存储 | 8 TB NVMe | 原始文件 + HTML + Milvus 索引 + Neo4j 数据 |
+| 存储 | 10 TB NVMe | 原始文件 + HTML + Milvus 索引 + ES 索引 + Neo4j 数据 |
 
 ### 存储估算（百万文档）
 
 ```
-原始 PDF:     100万 × 2MB   = 2 TB
-解析后 HTML:  100万 × 0.5MB = 500 GB
-Chunks+索引:  约 200 GB
-Milvus 向量:  5000万 × 1024维 = 200 GB
-Neo4j 图:     5000万节点 + 2亿边 = 500 GB-1 TB
-─────────────────────────────────────
-合计: 含冗余约 8 TB
+原始 PDF:      100万 × 2MB    = 2 TB
+解析后 HTML:   100万 × 0.5MB  = 500 GB
+Chunks+索引:   约 200 GB
+Milvus 向量:   5000万 × 1024维 = 200 GB
+ES 索引:       5000万 chunk × 约 1KB = 50 GB (含倒排+正排)
+Neo4j 图:      5000万节点 + 2亿边 = 500 GB-1 TB
+──────────────────────────────────────
+合计: 含冗余约 10 TB
 ```
 
 ### 服务部署
 
-Docker Compose: Milvus + Neo4j + MinIO + Redis + vLLM + FastAPI + 解析/Embedding/抽取 Worker
+Docker Compose: Elasticsearch + Milvus + Neo4j + MinIO + Redis + vLLM + FastAPI + 解析/Embedding/抽取 Worker
 
 ## 九、Phase 划分
 
@@ -272,9 +303,10 @@ Docker Compose: Milvus + Neo4j + MinIO + Redis + vLLM + FastAPI + 解析/Embeddi
 **目标**：把文档变成可检索的知识库
 
 - Docling + Marker + Qwen-VL 解析成 HTML
-- 多粒度分块 + BGE-M3 + Milvus
+- 多粒度分块 + BGE-M3 + Milvus + Elasticsearch（双路检索）
 - 财务指标 API 对接写入 Neo4j
 - L1 实体字典匹配写入 Neo4j
+- IK 分词器 + 金融词典扩展（股票代码、公司简称、金融术语）
 - 全文 QA + 指标查询 API
 
 **验证**：10 万文档导入检索，指标类问题返回 API 数据 + 原文引用，召回率 > 90%
@@ -318,4 +350,5 @@ Docker Compose: Milvus + Neo4j + MinIO + Redis + vLLM + FastAPI + 解析/Embeddi
 4. **分层抽取而非全 LLM** — L1 字典匹配 + L2/L3 LangExtract，降低百万级成本
 5. **财务指标 API 为唯一真相来源** — 不做 LLM 抽取，避免幻觉
 6. **申万行业分类** — 中国投资研究事实标准，三级 200+ 细分
-7. **渐进式交付** — Phase 1 基础能力 → Phase 2 图谱 → Phase 3 多模态 → Phase 4 生产化
+7. **ES BM25 + Milvus 稠密向量双路检索** — 关键词精确匹配与语义理解互补，RRF 融合排序
+8. **渐进式交付** — Phase 1 基础能力 → Phase 2 图谱 → Phase 3 多模态 → Phase 4 生产化
