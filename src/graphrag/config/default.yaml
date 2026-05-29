@@ -1,0 +1,77 @@
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  scan_queue_name: "scan_task"
+  parse_queue_name: "parse_task"
+  index_queue_name: "index_task"
+  scan_queue_maxsize: 500
+  parse_queue_maxsize: 200
+  index_queue_maxsize: 1000
+
+milvus:
+  host: "localhost"
+  port: 19530
+  collection_name: "document_chunks"
+  index_type: "IVF_FLAT"
+  metric_type: "COSINE"
+  nlist: 1024
+
+elasticsearch:
+  host: "localhost"
+  port: 9200
+  index_name: "document_chunks"
+  ik_analyzer: "ik_max_word"
+
+minio:
+  endpoint: "localhost:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  bucket_name: "graphrag-images"
+  secure: false
+
+embedding:
+  model_name: "jina-embeddings-v5-text-small"
+  dimensions: 1024
+  device: "cuda"
+  batch_size: 32
+  max_seq_length: 32768
+  query_prefix: "Query: "
+  document_prefix: "Document: "
+
+chunking:
+  section_min_tokens: 500
+  section_max_tokens: 2000
+  overlap_tokens: 100
+  simhash_distance: 3
+  simhash_bit: 64
+
+pipeline:
+  scan_workers: 25
+  parse_workers: 6
+  index_workers: 12
+  parse_timeout_seconds: 120
+  docling_batch_size: 12
+  docling_overlap_pages: 2
+  context_pages_before: 1
+  context_pages_after: 1
+
+query:
+  doubao_lite_model: "doubao-lite-32k"
+  doubao_pro_model: "doubao-pro-128k"
+  doubao_base_url: "https://api.doubao.com/v1"
+  temperature_default: 0.3
+  temperature_max: 0.7
+  intent_knowledge_base_size: 5
+  rrf_default_weight: 0.5
+  es_weight_code: 0.8
+  milvus_weight_code: 0.2
+  es_weight_semantic: 0.2
+  milvus_weight_semantic: 0.8
+  es_weight_mixed: 0.5
+  milvus_weight_mixed: 0.5
+
+storage:
+  pdf_dir: "data/pdf"
+  html_dir: "data/html"
+  output_dir: "data/output"
