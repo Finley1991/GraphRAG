@@ -16,7 +16,7 @@
 图谱层 → LangExtract + LLM 抽取 → Neo4j 知识图谱 → Cypher 查询
 向量层 → HTML 分块 → jina-embeddings-v5 → Milvus 稠密向量检索
 全文层 → HTML 分块 → IK 分词 + BM25 → Elasticsearch 关键词检索
-解析层 → Docling → HTML + 元数据 JSON
+解析层 → PyMuPDF(非表页) + Docling(表页) → 合并 HTML
 
 Phase 1 范围：解析层 + 向量层 + 全文层 + 查询层（不含 Neo4j）
 Phase 2 加入：图谱层 + 混合检索中的 Neo4j 路径
@@ -32,10 +32,11 @@ Phase 2 加入：图谱层 + 混合检索中的 Neo4j 路径
 
 | 工具 | 用途 | Phase 1 策略 |
 |------|------|-------------|
-| **Docling** | PDF/PPT/图片 → HTML，保留 rowspan/colspan | Phase 1 唯一解析器，覆盖全部文档 |
-| **Marker** | Docling 解析失败时的 PDF 兜底 | Phase 2 后按需引入 |
+| **Docling** | PDF/图片 → HTML，保留 rowspan/colspan | 仅处理**含表格的页**，经 PyMuPDF 路由后调用 |
+| **PyMuPDF** | PDF → HTML（`get_text("html")`） | 非表格页快速提取 HTML，~62 p/s |
+| **Marker** | Docling 解析失败时的兜底 | Phase 2 后按需引入 |
 | **Qwen-VL** | 图表/截图理解，生成结构化描述 | Phase 3 引入 |
-| **GLM-OCR** | 扫描件 OCR | Phase 2 后按需引入 |
+| **GLM-OCR** | 扫描件 OCR（API 调用） | Phase 2 后按需引入 |
 | **Pandas** | Excel/CSV 直接解析 | Phase 1 启用 |
 
 ### 输出格式
@@ -54,7 +55,7 @@ Phase 2 加入：图谱层 + 混合检索中的 Neo4j 路径
         "file_type": "pdf", "page_count": 45
     },
     "html_content": "<h1>...</h1><table>...</table>...",
-    "images": [{"id": "img_001", "description": "营收趋势柱状图...", "bbox": [...]}],
+    "images": [{"id": "img_001", "description": null, "minio_path": "minio://images/ann_20240523_600000/img_001.png", "bbox": [...]}],
     "tables": [{"id": "tab_001", "caption": "合并资产负债表", "html": "<table>...</table>"}],
     "parse_confidence": 0.95
 }
@@ -66,12 +67,48 @@ Phase 2 加入：图谱层 + 混合检索中的 Neo4j 路径
 
 ### 解析器策略
 
-**Phase 1：Docling 全覆盖。** 不设路由、不做置信度判断，单一解析器跑完 10 万文档。完成后统计：
+**Hybrid 按页路由：PyMuPDF + Docling**
 
-- 解析失败/低质量的比例和模式（扫描件、复杂表格、页眉页脚干扰等）
-- Docling 对不同 PDF 来源的实际覆盖率
+```
+PDF 文档（N 页）
+       │
+       ├── PyMuPDF 逐页扫描，检测表格
+       │   ├── 连续无表格 → 合并后 get_text("html") 批量提取
+       │   ├── 连续有表格 → 合并后整段送入 Docling 解析
+       │   └── 有表格页前后各补 1 页上下文 → 避免表格边界判断错误
+       │
+       └── 按页序合并 → 统一 HTML 文档（下游不感知页来源）
 
-**Phase 2+：根据实测数据决定兜底策略。** 包括是否需要 MinerU/Qwen-VL/GLM-OCR、阈值设多少、哪类文档走哪条路径。在拿到真实数据前不做假设。
+**路由规则：** 连续表格页合并为一段，整段送 Docling，确保跨页表格（如资产负债表上下两页）被完整解析。非表格页按连续段落合并，批量用 PyMuPDF 提取 HTML。
+```
+
+**为什么 Hybrid：**
+
+| 维度 | Docling 全量 | PyMuPDF + Docling 路由 |
+|------|-------------|----------------------|
+| 速度 | 慢，每页都走完整管线 | PyMuPDF ~62 p/s，Docling 仅跑 ~10-20% 的页 |
+| 内存 | 全量加载，内存泄漏风险高 | Docling 单次只处理几页，用完就释放 |
+| HTML 输出 | 原生 HTML | 统一 HTML，非表格页 `get_text("html")`，表格页 Docling HTML |
+| 10 万文档耗时 | ~30-50 天 | ~10-15 天 |
+
+**兜底策略：** PyMuPDF `find_tables()` 基于线检测，对无线表可能漏检。对检测到多列数字对齐但无边框线的页面，也送入 Docling 处理作为补充。
+
+### 图片处理策略
+
+PDF 中的图片（K 线图、营收柱状图、组织架构图等）分两阶段处理：
+
+**Phase 1：提取 + 存储，不做理解**
+- PyMuPDF / Docling 解析时检测图片区域，提取原始图片
+- 图片存入 MinIO，路径格式：`minio://images/{doc_id}/img_{page}_{idx}.png`
+- HTML 中留 `<img src="minio://images/{doc_id}/img_{page}_{idx}.png">` 占位
+- Chunk 中的 content_text 不含图片内容（纯文本字段无可描述）
+
+**Phase 3：Qwen-VL（API 或本地）理解图片**
+- 读取 MinIO 中已存储的图片，走 Qwen-VL 生成结构化描述
+- 描述内容写回对应 chunk 的 context 字段（如 `chart_description`）
+- 无需重新解析 PDF，仅增量处理已存的图片
+
+**优势：** Phase 1 不受视觉能力限制，Phase 3 不需要回溯解析管线。
 
 ## 三、文本分块 + 向量存储 + 全文索引
 
@@ -138,7 +175,7 @@ Table Chunk chunk_id 格式：`{doc_id}_t{table_idx}`（不另占一份向量/�
 
 ### 向量数据库
 
-**Milvus**：支持十亿级向量，标量过滤（按公司/行业/日期/文档类型），实现元数据预过滤 + 向量检索。
+**Milvus**：支持十亿级向量，标量过滤（按公司/行业/日期/文档类型），检索阶段不做硬过滤，全量打分后按语义排序。
 
 ### 全文检索引擎
 
@@ -305,7 +342,7 @@ L3 财务指标
 - 知识库可迭代——发现一次错误就丢一条标注数据进去，不需要重新训练或调 prompt
 - 新意图类型只需在知识库中新增示例即可支持，无需改代码
 
-**调用约定**：意图分类调用 Doubao（火山引擎）API，temperature=0。
+**调用约定**：意图分类调用 Doubao Lite（火山引擎）API，temperature=0。抽取类任务用 Lite，回答生成用 Pro。
 
 ### 实体链接管道
 
@@ -350,7 +387,7 @@ L3 财务指标
 | 模糊匹配 → 硬编码取 top 1 | 同名多实体（"茅台" = 股票/酒/地点）无法消歧 |
 | 模糊匹配 → LLM 消歧（当前方案） | 结合候选列表的上下文，既利用外部库的准确映射，又保留 LLM 的语义理解 |
 
-**调用约定**：Step 1 和 Step 3 调用 Doubao（火山引擎）API，temperature=0。与回答生成使用同一家 API 但不同 system prompt 和 temperature（回答生成使用 temperature=0.3-0.7）。
+**调用约定**：Step 1 和 Step 3 调用 Doubao Lite（火山引擎）API，temperature=0。回答生成用 Doubao Pro，temperature=0.3-0.7。抽取与生成按任务选型，互不影响。
 
 ### 全文 QA 的双路检索
 
@@ -396,6 +433,34 @@ w_milvus = 1 - w_es
 
 **权重维护**：测试集每扩充一次，网格搜索重新跑一次。如果某意图最优权重下的召回率仍低于 90%，说明问题不在融合权重而在检索源或路由逻辑。
 
+### 检索过滤策略
+
+检索阶段不做硬过滤（metadata 预过滤 / ES bool filter），全量打分后按语义排序：
+
+```
+query "银行股 2024年 ROE"
+  → ES BM25 全量打分（"银行"+"2024"+"ROE" 自然命中行业+年份+指标）
+  → Milvus 全量向量搜索（语义编码已经包含了行业和时间信息）
+  → RRF 融合 → top 15 → LLM 生成
+```
+
+**理由：**
+
+| 方案 | 问题 |
+|------|------|
+| 元数据预过滤 | 实体链接错误 → 过滤条件错误 → 检索漏掉正确文档 |
+| 不做过滤（当前方案） | 实体链接错误只影响 API 指标查询路径，不殃及检索召回 |
+
+**可选后处理（Phase 2 评估后决定）：**
+
+当测试集 MRR < 0.8 时，在 RRF 后加轻量 rerank：
+
+```
+ES top 20 + Milvus top 20 → RRF top 30 → rerank(query, candidate) → top 10 → LLM
+```
+
+rerank 可用 BGE-reranker 或 query-chunk 余弦相似度。Phase 1 先用纯 RRF 跑 baseline。
+
 ### 5 类查询的执行路径
 
 | 查询类型 | 示例 | Phase 1 路径 | Phase 2+ 增强 |
@@ -424,20 +489,20 @@ w_milvus = 1 - w_es
 
 | 组件 | 选型 | 说明 |
 |------|------|------|
-| 文档解析 | Docling | Phase 1 全覆盖，HTML 输出；Phase 2+ 据实测数据决定引入 Marker/GLM-OCR/Qwen-VL |
-| OCR | GLM-OCR | 扫描件，替代 PaddleOCR |
+| 文档解析 | PyMuPDF + Docling 混合 | PyMuPDF 快速扫描+按页路由，Docling 仅处理含表格的页，合并输出统一 HTML |
+| OCR | GLM-OCR（API 调用） | 扫描件，替代 PaddleOCR |
 | 图数据库 | Neo4j | Phase 2 引入，Cypher 查询 |
-| 向量数据库 | Milvus | 亿级向量支持，标量过滤 |
+| 向量数据库 | Milvus | 亿级向量，检索不做硬过滤，全量打分按语义排序 |
 | 全文检索引擎 | Elasticsearch | BM25 + IK 中文分词，关键词精确匹配；支持 simhash 字段查重 |
 | Embedding | jina-embeddings-v5-text-small | 32K context，原生中文，Matryoshka 多维度截断；同时用于意图知识库检索 |
 | Chunk 去重 | simhash（64 位指纹） | 写入前查重，海明距离 < 3 视为近似重复跳过 |
-| LLM API | Doubao（火山引擎） | 意图分类、实体抽取/消歧、回答生成；同一家 API，不同 task 不同 system prompt + temperature |
+| LLM API | Doubao Pro(生成) + Doubao Lite(抽取/分类) | Lite 用于意图分类、实体抽取/消歧、NER/RE（temperature=0）；Pro 用于回答生成（temperature=0.3-0.7）。按任务选型，成本隔离开 |
 | 对象存储 | MinIO | 原始 PDF + HTML |
-| 任务队列 | Redis | 异步处理调度 |
-| NER/RE | LangExtract | L2 深层关系 + 事件抽取 |
+| 任务队列 | Redis | 3 个独立队列，三阶段 worker pool 解耦 |
+| NER/RE | LangExtract（调用 Doubao Lite） | L2 深层关系 + 事件抽取 |
 | 图表理解 | Qwen-VL | 财报图表结构化描述 |
 | Web 框架 | FastAPI | 查询 API |
-| 实体链接 | LLM(外部 API) + 模糊匹配接口 | Step1 抽取 → Step2 模糊匹配 → Step3 消歧，temperature=0 |
+| 实体链接 | LLM(Doubao Lite) + 模糊匹配接口 | Step1 抽取 → Step2 模糊匹配 → Step3 消歧，temperature=0 |
 
 ## 八、硬件部署
 
@@ -445,10 +510,20 @@ w_milvus = 1 - w_es
 
 | 组件 | 推荐配置 | 用途 |
 |------|---------|------|
-| CPU | 64 核 | 文档解析、分块 |
-| 内存 | **128 GB** | 解析中间态、ES 堆内存(建议 16-32GB)[Phase 2+ 加入 Neo4j 缓存] |
-| GPU | 1× 中端卡（如 RTX 3060 12GB） | Embedding 模型推理（Phase 3 可选加 Qwen-VL） |
+| CPU | 64 核 | PyMuPDF 批量扫描 + Docling 按页解析 + 分块 |
+| 内存 | **64 GB**（Phase 1 够用，128 GB Phase 2+） | ES 堆内存 16GB；Docling 每 worker ~4GB，余量充足 |
+| GPU | **RTX 3090 24GB** | Docling 表格页解析加速（CPU 也可行，速度降 2-3 倍） |
 | 存储 | 10 TB NVMe | 原始文件 + HTML + Milvus 索引 + ES 索引 + Neo4j 数据 |
+
+**处理参数（RTX 3090 / 64GB 基准）：**
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| 连续表格页批大小 | 12 页 | VRAM 24GB ÷ ~1.5GB/页，留余量 |
+| 跨批补页 | 每批前后各补 2 页 | 避免跨批表格被切碎 |
+| parse_task 并发 | 2-3 workers | 64GB 内存下每 worker ~4GB，不影响 ES |
+| 单文档超时 | 120 秒 | 12 页 × ~8 秒/页（含模型加载） |
+| 吞吐量 | ~100-150 文档/天/worker | 纯解析，不含扫描和索引；100k ≈ 4-6 周 |
 
 ### 存储估算
 
@@ -473,12 +548,50 @@ Neo4j 图:      5000万节点 + 2亿边 = 500 GB-1 TB
 合计: 含冗余约 3-4 TB（不含 Neo4j 约 3 TB）
 ```
 
+### 异步处理管线（三阶段队列）
+
+针对解析管线各步骤资源需求差异大（PyMuPDF CPU 密集、Docling 内存敏感、索引 IO 密集），设计三个独立 worker pool：
+
+```
+                     ┌─────────────────────┐
+                     │   Raw PDF files      │
+                     └──────────┬──────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │  🔵 scan_task pool     │  ← 20-30 workers
+                    │  PyMuPDF: 检测表格页   │     CPU only
+                    │  输出文档: 无表页 HTML  │     失败重试成本极低
+                    │          + 表格页范围    │
+                    └───────────┬───────────┘
+                                │ PDF + 表格页范围
+                    ┌───────────▼───────────┐
+                    │  🟡 parse_task pool     │  ← 4-8 workers
+                    │  Docling: 解析表格页    │     关注内存
+                    │  合并为完整 HTML 文档    │     worker 用完销毁
+                    └───────────┬───────────┘
+                                │ HTML
+                    ┌───────────▼───────────┐
+                    │  🟢 index_task pool     │  ← 10-15 workers
+                    │  分块 + Embedding        │     幂等写入
+                    │  simhash 查重             │
+                    │  事务协调 → ES+Milvus     │
+                    └────────────────────────┘
+```
+
+| Pool | 资源瓶颈 | 并发 | 失败处理 |
+|------|---------|------|---------|
+| scan_task | CPU 核数 | 20-30，全核跑满 | 整段重跑，成本极低 |
+| parse_task | 内存 | 4-8，每次用完销毁重建，避免 Docling 泄漏 | 仅重试表格页，保留已有扫描结果 |
+| index_task | IO（ES+Milvus 写入） | 10-15，幂等写入 | 单独重试失败 chunk，不波及整文档 |
+
+三阶段通过 Redis 队列解耦，每个队列独立消费，不互相阻塞。
+
 ### 服务部署
 
-Docker Compose:
-- **Phase 1**: Elasticsearch + Milvus + MinIO + Redis + FastAPI + 解析/Embedding Worker
+Docker Compose：
+- **Phase 1**: Elasticsearch + Milvus + MinIO + Redis（3 个队列）+ FastAPI + 3 个 Worker Pool（scan/parse/index）
 - **Phase 2 加入**: Neo4j + 抽取 Worker
-- **LLM**: Doubao（火山引擎）API，不自建
+- **LLM**: Doubao API：抽取/分类用 Lite，回答生成用 Pro
 
 ## 九、Phase 划分
 
@@ -486,7 +599,7 @@ Docker Compose:
 
 **目标**：把文档变成可检索的知识库
 
-- Docling 解析成 HTML（Phase 2+ 根据实测数据决定是否引入兜底解析器）
+- PyMuPDF 快速扫描每页，无表格页 `get_text("html")`，有表格页路由 Docling 解析成 HTML → 合并为统一 HTML 文档
 - 多粒度分块 + jina-embeddings-v5 + Milvus + Elasticsearch（双路检索）
 - 分块时每 chunk 生成 simhash 指纹，写入前查重（跨文档近似重复跳过）
 - IK 分词器 + 金融词典扩展——每日自动更新，对比数据库增量获取新股代码+简称+新金融术语
@@ -512,13 +625,13 @@ Docker Compose:
 - 实体链接 + 图谱去重合并
 - 混合检索引擎（Graph + Vector 并行）
 
-**验证**：供应链查询返回关联公司及出处，关系抽取准确率 > 85%
+**验证**：从测试集中选取含关系/事件的 query，构建标注数据集评估 LangExtract 抽取质量，关系抽取准确率 > 85%
 
 ### Phase 3：多模态理解 + 时序分析
 
 **目标**：图表关联 + 时序对比
 
-- ChartImage 与文档引用的自动关联
+- 读取 MinIO 中 Phase 1 存储的图片，Qwen-VL 生成结构化描述写入 chunk context
 - 表格 HTML 结构化增强
 - MarketDataPoint 行情数据接入
 - 财务指标时序对比分析
@@ -528,7 +641,7 @@ Docker Compose:
 
 **目标**：系统稳定运行
 
-- 增量文档监听自动解析入库
+- 每日定时扫描源目录，对比文件修改时间与上次扫描时间，新/变更的文档自动进入 scan → parse → index 管线
 - 图过期策略（旧事件/概念降权）
 - 性能优化（检索延迟 < 2s）
 - 前端 Web UI
@@ -537,7 +650,7 @@ Docker Compose:
 ## 十、关键设计决策
 
 1. **HTML 替代 Markdown** — 财务报表合并单元格 Markdown 无法表示
-2. **Docling 全覆盖，MinerU 按需引入** — Phase 1 单一解析器，根据 10 万文档实测数据决定 Phase 2 的兜底策略
+2. **Hybrid 路由解析：PyMuPDF + Docling** — PyMuPDF 快速扫描按页路由，无表格页直接 `get_text("html")`，有表格页走 Docling。既避免 Docling 全量解析的性能和内存泄漏问题，又保持统一 HTML 输出
 3. **GLM-OCR 替代 PaddleOCR** — 中文金融表格识别更优
 4. **分层抽取而非全 LLM** — L1 字典匹配 + L2/L3 LangExtract，降低百万级成本
 5. **财务指标 API 为唯一真相来源** — 不做 LLM 抽取，避免幻觉

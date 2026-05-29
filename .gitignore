@@ -11,3 +11,8 @@ build/
 *.swp
 *.swo
 .DS_Store
+
+# Skills / agent artifacts (installed by npx skills@latest)
+.agents/
+.superpowers/
+skills-lock.json
