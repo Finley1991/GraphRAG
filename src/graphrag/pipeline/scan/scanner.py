@@ -54,13 +54,14 @@ class PDFScanner:
 
         table_ranges = self._find_continuous_ranges(table_pages)
         context_ranges = self._compute_context_ranges(table_pages, total_pages)
+        context_range_list = self._find_continuous_ranges(context_ranges)
 
         return {
             "total_pages": total_pages,
             "table_pages": sorted(table_pages),
             "tableless_html_pages": tableless_html,
             "table_page_ranges": table_ranges,
-            "context_page_ranges": context_ranges,
+            "context_page_ranges": context_range_list,
         }
 
     def scan_page_safe(self, filepath: str, page_num: int) -> Optional[str]:
