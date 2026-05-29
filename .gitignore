@@ -16,3 +16,4 @@ build/
 .agents/
 .superpowers/
 skills-lock.json
+docs/
