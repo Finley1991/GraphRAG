@@ -6,6 +6,7 @@ from graphrag.pipeline.common.worker import BaseWorker
 from graphrag.pipeline.scan.scanner import PDFScanner
 from graphrag.models.tasks import ScanTask
 from graphrag.config.settings import load_settings
+from graphrag.pipeline.common.redis_manager import Queue
 
 
 class ScanWorker(BaseWorker):
@@ -23,6 +24,10 @@ class ScanWorker(BaseWorker):
     @property
     def output_queue_name(self) -> str:
         return self._output_queue_name
+
+    async def shutdown(self):
+        self._executor.shutdown(wait=False)
+        await super().shutdown()
 
     async def process(self, task: dict) -> dict:
         scan_task = ScanTask(**task)
@@ -53,7 +58,10 @@ class ScanWorker(BaseWorker):
         }
 
         if self._queue:
-            output_queue = type(self._queue)(self._redis, self._output_queue_name)
+            output_queue = Queue(self._redis, self._output_queue_name, maxsize=settings.redis.parse_queue_maxsize)
+            if await output_queue.size() >= output_queue._maxsize:
+                logger.warning(f"Output queue {self._output_queue_name} is full, retrying later")
+                return {"stage": "queue_full", "doc_id": doc.doc_id}
             await output_queue.push(parse_task)
 
         return {

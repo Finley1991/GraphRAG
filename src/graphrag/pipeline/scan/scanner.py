@@ -65,15 +65,18 @@ class PDFScanner:
         }
 
     def scan_page_safe(self, filepath: str, page_num: int) -> Optional[str]:
+        doc = None
         try:
             doc = fitz.open(filepath)
             page = doc.load_page(page_num)
             html = page.get_text("html")
-            doc.close()
             return html
         except Exception as e:
             logger.error(f"Failed to scan page {page_num} of {filepath}: {e}")
             return None
+        finally:
+            if doc:
+                doc.close()
 
     def _find_continuous_ranges(self, pages: set[int]) -> list[PageRange]:
         if not pages:

@@ -12,7 +12,7 @@ import re
 import os
 from pathlib import Path
 
-PLANS_DIR = Path("/data1/wangyafan/zhima_ai/claud_code/GraphRAG/docs/superpowers/plans")
+PLANS_DIR = Path(__file__).resolve().parent.parent / "docs/superpowers/plans"
 TASKS_DIR = PLANS_DIR / "tasks"
 
 plan_configs = [
@@ -27,9 +27,6 @@ plan_configs = [
         "pattern": r"^### Task (\d+): (.+)",
         "phase": 2,
         "name": "知识图谱构建",
-        # Phase 2 has non-task h3 sections (供应链关系, 股权关系 etc.)
-        # We need to ensure we only split on actual Task headings
-        "task_only": True,
     },
     {
         "file": PLANS_DIR / "2026-05-29-phase3-multimodal-timeseries-plan.md",
@@ -58,7 +55,7 @@ def slugify(title: str, max_len: int = 50) -> str:
     return s
 
 
-def split_plan(file_path: Path, pattern: str, phase: int, phase_name: str, task_only: bool = False):
+def split_plan(file_path: Path, pattern: str, phase: int, phase_name: str):
     """Split a plan file into individual task files."""
     content = file_path.read_text(encoding="utf-8")
 
@@ -170,9 +167,7 @@ def main():
             pattern=cfg["pattern"],
             phase=cfg["phase"],
             phase_name=cfg["name"],
-            task_only=cfg.get("task_only", False),
         )
-
         if tasks:
             doc = create_progress_doc(
                 phase=cfg["phase"],

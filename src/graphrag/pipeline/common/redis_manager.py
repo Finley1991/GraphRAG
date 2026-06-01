@@ -45,6 +45,8 @@ class Queue:
 
     async def push(self, data: dict) -> bool:
         r = await self._mgr.client()
+        if self._maxsize > 0 and await self.size() >= self._maxsize:
+            return False
         msg = json.dumps(data, ensure_ascii=False)
         await r.lpush(self._queue_key, msg)
         return True
