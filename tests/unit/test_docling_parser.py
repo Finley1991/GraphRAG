@@ -1,5 +1,7 @@
 """Tests for DoclingTableParser and PageBatcher."""
+import asyncio
 import pytest
+from unittest.mock import patch
 from graphrag.pipeline.parse.docling_parser import DoclingParser, PageBatcher
 
 
@@ -65,5 +67,10 @@ class TestDoclingParser:
     @pytest.mark.asyncio
     async def test_parse_pages_failure_returns_none(self):
         parser = DoclingParser()
-        result = await parser.parse_pages("/nonexistent/file.pdf", (0, 1))
-        assert result is None
+        with patch.object(
+            asyncio.get_event_loop(), "run_in_executor"
+        ) as mock_run:
+            mock_run.return_value = asyncio.Future()
+            mock_run.return_value.set_exception(Exception("parse error"))
+            result = await parser.parse_pages("/nonexistent/file.pdf", (0, 1))
+            assert result is None
