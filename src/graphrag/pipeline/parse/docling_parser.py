@@ -3,7 +3,6 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from docling.document_converter import DocumentConverter
 from loguru import logger
 
 from graphrag.config.settings import load_settings
@@ -47,6 +46,33 @@ class DoclingParser:
         self._batcher = PageBatcher(self.batch_size, self.overlap)
         self._executor = ThreadPoolExecutor(max_workers=2)
 
+    def _make_converter(self):
+        """Create a GPU-accelerated DocumentConverter."""
+        from docling.document_converter import (
+            DocumentConverter,
+            FormatOption,
+            InputFormat,
+        )
+        from docling.datamodel.pipeline_options import (
+            AcceleratorDevice,
+            AcceleratorOptions,
+            PdfPipelineOptions,
+        )
+        from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
+        from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
+
+        acc_opts = AcceleratorOptions(num_threads=4, device=AcceleratorDevice.CUDA)
+        pipeline_opts = PdfPipelineOptions()
+        pipeline_opts.accelerator_options = acc_opts
+        pipeline_opts.do_table_structure = True
+        pipeline_opts.do_ocr = False
+        fmt_opts = FormatOption(
+            backend=DoclingParseDocumentBackend,
+            pipeline_cls=StandardPdfPipeline,
+            pipeline_options=pipeline_opts,
+        )
+        return DocumentConverter(format_options={InputFormat.PDF: fmt_opts})
+
     async def parse_pages(
         self, filepath: str, page_range: tuple[int, int]
     ) -> Optional[str]:
@@ -68,7 +94,7 @@ class DoclingParser:
 
     def _parse_sync(self, filepath: str, page_range: tuple[int, int]) -> str:
         """Synchronous Docling conversion. Runs in executor thread."""
-        converter = DocumentConverter()
+        converter = self._make_converter()
         start, end = page_range
         pages_str = f"{start}-{end}" if start != end else str(start)
         uri = f"{filepath}#pages={pages_str}"
